@@ -10,6 +10,7 @@ from pathlib import Path
 from typing import Optional, Dict, Any, List
 
 from fastapi import FastAPI, HTTPException, Query, BackgroundTasks
+from fastapi.responses import FileResponse, JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
@@ -295,18 +296,49 @@ def run_demucs_separation_sync(video_id: str, audio_path: Path, output_dir: Path
         active_jobs[video_id]["progress"] = 96
         active_jobs[video_id]["message"] = "កំពុងរៀបចំ និងរក្សាទុកឯកសារភ្លេងខារ៉ាអូខេ..."
 
-    # Locate generated stems recursively
-    found_vocals = list(temp_demucs_dir.glob("**/vocals.wav"))
-    found_no_vocals = list(temp_demucs_dir.glob("**/no_vocals.wav"))
+    # Locate generated stems dynamically
+    found_vocals = list(temp_demucs_dir.rglob("vocals.wav")) or list(Path("separated").rglob("vocals.wav"))
+    found_no_vocals = list(temp_demucs_dir.rglob("no_vocals.wav")) or list(Path("separated").rglob("no_vocals.wav"))
+
+    if not found_vocals:
+        found_vocals = [p for p in temp_demucs_dir.rglob("*.wav") if "vocal" in p.name.lower() and "no" not in p.name.lower()]
+    if not found_no_vocals:
+        found_no_vocals = [p for p in temp_demucs_dir.rglob("*.wav") if "no_vocal" in p.name.lower() or "instrumental" in p.name.lower()]
 
     if not found_vocals or not found_no_vocals:
         raise Exception("Separated stems (vocals/no_vocals) not found in Demucs output.")
 
+    src_vocals = found_vocals[0]
+    src_no_vocals = found_no_vocals[0]
+
+    if src_vocals.stat().st_size < 1000:
+        raise Exception(f"Demucs generated invalid/empty vocals stem: {src_vocals}")
+    if src_no_vocals.stat().st_size < 1000:
+        raise Exception(f"Demucs generated invalid/empty no_vocals stem: {src_no_vocals}")
+
     target_vocals = output_dir / "vocals.wav"
     target_no_vocals = output_dir / "no_vocals.wav"
 
-    shutil.move(str(found_vocals[0]), str(target_vocals))
-    shutil.move(str(found_no_vocals[0]), str(target_no_vocals))
+    # CRITICAL: Verify instrumental is NOT original audio
+    if src_no_vocals.resolve() == audio_path.resolve():
+        raise Exception("Demucs error: Instrumental source is identical to original audio!")
+
+    # Safely copy to target destinations
+    if target_vocals.exists():
+        try: target_vocals.unlink()
+        except Exception: pass
+    if target_no_vocals.exists():
+        try: target_no_vocals.unlink()
+        except Exception: pass
+
+    shutil.copy2(str(src_vocals), str(target_vocals))
+    shutil.copy2(str(src_no_vocals), str(target_no_vocals))
+
+    # Verify both final files exist and are > 1000 bytes
+    if not target_vocals.is_file() or target_vocals.stat().st_size < 1000:
+        raise Exception("Target vocals.wav was not written successfully.")
+    if not target_no_vocals.is_file() or target_no_vocals.stat().st_size < 1000:
+        raise Exception("Target no_vocals.wav was not written successfully.")
 
     # Clean up temporary demucs folder to conserve disk space
     try:
@@ -323,16 +355,23 @@ async def run_pipeline(video_id: str, force: bool = False, lang: Optional[str] =
     async with job_locks[video_id]:
         video_dir = get_video_dir(video_id)
 
-        # Check if already cached (Both stems AND lyrics must exist)
+        # Check if already cached (stems exist on disk)
         if not force and stems_exist(video_id):
             meta = read_metadata(video_id)
-            if not lyrics_exist(video_id):
+            has_lyrics = lyrics_exist(video_id)
+            if not has_lyrics:
                 active_jobs[video_id] = {
-                    "status": "processing",
-                    "stage": "transcribing",
-                    "progress": 82,
-                    "message": "AI Whisper កំពុងស្តាប់ និងបង្កើតអក្សរខារ៉ាអូខេ (82%)...",
-                    "video_id": video_id
+                    "status": "completed",
+                    "stage": "ready_to_sing",
+                    "progress": 95,
+                    "message": "Vocal cut completed! Ready to sing / download instrumental.",
+                    "video_id": video_id,
+                    "title": meta.get("title", f"YouTube Video ({video_id})"),
+                    "vocals_url": f"/media/{video_id}/vocals.wav",
+                    "instrumental_url": f"/media/{video_id}/no_vocals.wav",
+                    "direct_audio_url": f"/media/{video_id}/audio.wav" if (video_dir / "audio.wav").exists() else None,
+                    "lyrics_ready": False,
+                    "cached": True
                 }
                 try:
                     await asyncio.to_thread(fetch_lyrics_for_video, video_id, False, lang)
@@ -341,15 +380,15 @@ async def run_pipeline(video_id: str, force: bool = False, lang: Optional[str] =
 
             active_jobs[video_id] = {
                 "status": "completed",
-                "stage": "completed",
+                "stage": "completed" if lyrics_exist(video_id) else "ready_to_sing",
                 "progress": 100,
-                "message": "រួចរាល់ 100% (Cached)",
+                "message": "Vocal cut completed! Ready to sing / download instrumental.",
                 "video_id": video_id,
                 "title": meta.get("title", f"YouTube Video ({video_id})"),
                 "vocals_url": f"/media/{video_id}/vocals.wav",
                 "instrumental_url": f"/media/{video_id}/no_vocals.wav",
                 "direct_audio_url": f"/media/{video_id}/audio.wav" if (video_dir / "audio.wav").exists() else None,
-                "lyrics_ready": True,
+                "lyrics_ready": lyrics_exist(video_id),
                 "cached": True
             }
             return
@@ -360,7 +399,7 @@ async def run_pipeline(video_id: str, force: bool = False, lang: Optional[str] =
                 "status": "processing",
                 "stage": "downloading",
                 "progress": 15,
-                "message": "កំពុងទាញយកសំឡេងពី YouTube...",
+                "message": "Downloading audio...",
                 "video_id": video_id
             }
 
@@ -368,40 +407,36 @@ async def run_pipeline(video_id: str, force: bool = False, lang: Optional[str] =
 
             active_jobs[video_id]["progress"] = 35
             active_jobs[video_id]["direct_audio_url"] = f"/media/{video_id}/audio.wav"
-            active_jobs[video_id]["message"] = "ទាញយកសំឡេងជោគជ័យ! កំពុងចាប់ផ្តើម AI Demucs..."
+            active_jobs[video_id]["message"] = "Separating vocals with AI..."
 
             # Stage 2: Separating with Demucs AI
             active_jobs[video_id]["stage"] = "separating"
             active_jobs[video_id]["progress"] = 40
-            active_jobs[video_id]["message"] = "AI កំពុងកាត់សំឡេងច្រៀងចេញ (95% Vocal Removal)..."
+            active_jobs[video_id]["message"] = "Separating vocals with AI..."
 
             await asyncio.to_thread(run_demucs_separation_sync, video_id, wav_path, video_dir)
 
-            # Stage 3: Transcribing Lyrics (AI Whisper Base / Captions)
-            active_jobs[video_id]["stage"] = "transcribing"
-            active_jobs[video_id]["progress"] = 85
-            active_jobs[video_id]["message"] = "AI Whisper កំពុងស្តាប់ និងបង្កើតអក្សរខារ៉ាអូខេ (85%)..."
+            # Stage 3: Vocal cut completed! Immediate availability of instrumental & vocals
+            meta = read_metadata(video_id)
+            active_jobs[video_id]["status"] = "completed"
+            active_jobs[video_id]["stage"] = "ready_to_sing"
+            active_jobs[video_id]["progress"] = 95
+            active_jobs[video_id]["message"] = "Vocal cut completed! Ready to sing / download instrumental."
+            active_jobs[video_id]["title"] = meta.get("title", f"YouTube Video ({video_id})")
+            active_jobs[video_id]["vocals_url"] = f"/media/{video_id}/vocals.wav"
+            active_jobs[video_id]["instrumental_url"] = f"/media/{video_id}/no_vocals.wav"
+            active_jobs[video_id]["direct_audio_url"] = f"/media/{video_id}/audio.wav"
+            active_jobs[video_id]["lyrics_ready"] = lyrics_exist(video_id)
 
+            # Stage 4: Transcribing Lyrics in background (does not block playback or download)
             try:
                 await asyncio.to_thread(fetch_lyrics_for_video, video_id, False, lang)
             except Exception as lyr_err:
                 logger.warning(f"Background lyrics transcription notice for {video_id}: {lyr_err}")
 
-            # Stage 4: Completed
-            meta = read_metadata(video_id)
-            active_jobs[video_id] = {
-                "status": "completed",
-                "stage": "completed",
-                "progress": 100,
-                "message": "បំបែកភ្លេង និងរៀបចំអក្សរខារ៉ាអូខេរួចរាល់ 100%!",
-                "video_id": video_id,
-                "title": meta.get("title", f"YouTube Video ({video_id})"),
-                "vocals_url": f"/media/{video_id}/vocals.wav",
-                "instrumental_url": f"/media/{video_id}/no_vocals.wav",
-                "direct_audio_url": f"/media/{video_id}/audio.wav",
-                "lyrics_ready": True,
-                "cached": False
-            }
+            active_jobs[video_id]["progress"] = 100
+            active_jobs[video_id]["stage"] = "completed"
+            active_jobs[video_id]["lyrics_ready"] = lyrics_exist(video_id)
             logger.info(f"Video {video_id} processing completed successfully.")
 
         except Exception as e:
@@ -561,41 +596,47 @@ async def process_video(req: ProcessRequest, background_tasks: BackgroundTasks):
     # Record song sung to server history for multi-browser sync
     record_song_sung(video_id)
 
-    # 1. If already cached (BOTH stems AND lyrics exist), return completed immediately
-    if not req.force_reprocess and stems_exist(video_id) and lyrics_exist(video_id):
+    # 1. If already cached (BOTH stems exist), return completed immediately
+    if not req.force_reprocess and stems_exist(video_id):
         meta = read_metadata(video_id)
         video_dir = get_video_dir(video_id)
+        has_lyrics = lyrics_exist(video_id)
+        if not has_lyrics:
+            background_tasks.add_task(fetch_lyrics_for_video, video_id, False, req.language or "km")
         return {
             "status": "completed",
-            "stage": "completed",
-            "progress": 100,
-            "message": "រួចរាល់ 100% (Cached)",
+            "stage": "completed" if has_lyrics else "ready_to_sing",
+            "progress": 100 if has_lyrics else 95,
+            "message": "Vocal cut completed! Ready to sing / download instrumental.",
             "video_id": video_id,
             "title": meta.get("title", f"YouTube Video ({video_id})"),
             "vocals_url": f"/media/{video_id}/vocals.wav",
             "instrumental_url": f"/media/{video_id}/no_vocals.wav",
             "direct_audio_url": f"/media/{video_id}/audio.wav" if (video_dir / "audio.wav").exists() else None,
-            "lyrics_ready": True,
+            "lyrics_ready": has_lyrics,
             "cached": True
         }
 
     # 2. If already processing, return current job state
     current_job = active_jobs.get(video_id)
-    if current_job and current_job.get("status") == "processing":
+    if current_job and current_job.get("status") in ["processing", "completed"]:
         return current_job
 
     # 3. Initialize job and dispatch background processing
     initial_stage = "transcribing" if stems_exist(video_id) else "downloading"
-    initial_progress = 80 if stems_exist(video_id) else 10
-    initial_msg = "AI កំពុងស្តាប់ និងរៀបចំអក្សរខារ៉ាអូខេ (80%)..." if stems_exist(video_id) else "កំពុងទាញយកសំឡេងពី YouTube..."
+    initial_progress = 95 if stems_exist(video_id) else 10
+    initial_msg = "Vocal cut completed! Ready to sing / download instrumental." if stems_exist(video_id) else "Downloading audio..."
 
     active_jobs[video_id] = {
-        "status": "processing",
+        "status": "completed" if stems_exist(video_id) else "processing",
         "stage": initial_stage,
         "progress": initial_progress,
         "message": initial_msg,
         "video_id": video_id
     }
+    if stems_exist(video_id):
+        active_jobs[video_id]["vocals_url"] = f"/media/{video_id}/vocals.wav"
+        active_jobs[video_id]["instrumental_url"] = f"/media/{video_id}/no_vocals.wav"
 
     background_tasks.add_task(run_pipeline, video_id, req.force_reprocess, req.language or "km")
     return active_jobs[video_id]
@@ -607,21 +648,22 @@ async def get_status(video_id: str):
     if not validate_video_id(video_id):
         raise HTTPException(status_code=400, detail="Invalid video ID")
 
-    # 1. If stems exist AND lyrics exist on disk, return completed
-    if stems_exist(video_id) and lyrics_exist(video_id):
+    # 1. If stems exist on disk, always return completed with separate actual stem URLs!
+    if stems_exist(video_id):
         meta = read_metadata(video_id)
         video_dir = get_video_dir(video_id)
+        has_lyrics = lyrics_exist(video_id)
         return {
             "status": "completed",
-            "stage": "completed",
-            "progress": 100,
-            "message": "រួចរាល់ 100%",
+            "stage": "completed" if has_lyrics else "ready_to_sing",
+            "progress": 100 if has_lyrics else 95,
+            "message": "Vocal cut completed! Ready to sing / download instrumental.",
             "video_id": video_id,
             "title": meta.get("title", ""),
             "vocals_url": f"/media/{video_id}/vocals.wav",
             "instrumental_url": f"/media/{video_id}/no_vocals.wav",
             "direct_audio_url": f"/media/{video_id}/audio.wav" if (video_dir / "audio.wav").exists() else None,
-            "lyrics_ready": True,
+            "lyrics_ready": has_lyrics,
             "cached": True
         }
 
@@ -631,25 +673,76 @@ async def get_status(video_id: str):
         video_dir = get_video_dir(video_id)
         if (video_dir / "audio.wav").exists():
             job["direct_audio_url"] = f"/media/{video_id}/audio.wav"
+        if (video_dir / "no_vocals.wav").exists() and (video_dir / "no_vocals.wav").stat().st_size > 1000:
+            job["instrumental_url"] = f"/media/{video_id}/no_vocals.wav"
+            job["vocals_url"] = f"/media/{video_id}/vocals.wav"
+            job["status"] = "completed"
         return job
 
-    # 3. If stems exist but lyrics are missing, mark transcribing
-    if stems_exist(video_id) and not lyrics_exist(video_id):
-        return {
-            "status": "processing",
-            "stage": "transcribing",
-            "progress": 82,
-            "message": "AI Whisper កំពុងស្តាប់ និងបង្កើតអក្សរខារ៉ាអូខេ (82%)...",
-            "video_id": video_id
-        }
-
-    # 4. Idle / not started
+    # 3. Idle / not started
     return {
         "status": "idle",
         "stage": "idle",
         "progress": 0,
         "message": "មិនទាន់ចាប់ផ្តើមដំណើរការនៅឡើយ"
     }
+
+
+@app.get("/api/download/{video_id}/instrumental")
+async def download_instrumental(video_id: str):
+    """Downloads pure separated instrumental track (no_vocals.wav) with vocal removed."""
+    if not validate_video_id(video_id):
+        raise HTTPException(status_code=400, detail="Invalid video ID")
+    video_dir = get_video_dir(video_id)
+    no_vocals_path = video_dir / "no_vocals.wav"
+    if not no_vocals_path.is_file() or no_vocals_path.stat().st_size < 1000:
+        raise HTTPException(status_code=404, detail="Instrumental track (no_vocals.wav) not ready or not found.")
+    meta = read_metadata(video_id)
+    raw_title = meta.get("title") or video_id
+    safe_title = re.sub(r'[\\/*?:"<>|]', "", raw_title).strip() or video_id
+    return FileResponse(
+        path=str(no_vocals_path),
+        media_type="audio/wav",
+        filename=f"{safe_title}_instrumental.wav"
+    )
+
+
+@app.get("/api/download/{video_id}/vocals")
+async def download_vocals(video_id: str):
+    """Downloads pure isolated vocal track (vocals.wav)."""
+    if not validate_video_id(video_id):
+        raise HTTPException(status_code=400, detail="Invalid video ID")
+    video_dir = get_video_dir(video_id)
+    vocals_path = video_dir / "vocals.wav"
+    if not vocals_path.is_file() or vocals_path.stat().st_size < 1000:
+        raise HTTPException(status_code=404, detail="Vocals track (vocals.wav) not ready or not found.")
+    meta = read_metadata(video_id)
+    raw_title = meta.get("title") or video_id
+    safe_title = re.sub(r'[\\/*?:"<>|]', "", raw_title).strip() or video_id
+    return FileResponse(
+        path=str(vocals_path),
+        media_type="audio/wav",
+        filename=f"{safe_title}_vocals.wav"
+    )
+
+
+@app.get("/api/download/{video_id}/original")
+async def download_original(video_id: str):
+    """Downloads original unseparated audio track (audio.wav)."""
+    if not validate_video_id(video_id):
+        raise HTTPException(status_code=400, detail="Invalid video ID")
+    video_dir = get_video_dir(video_id)
+    audio_path = video_dir / "audio.wav"
+    if not audio_path.is_file() or audio_path.stat().st_size < 1000:
+        raise HTTPException(status_code=404, detail="Original audio track (audio.wav) not ready or not found.")
+    meta = read_metadata(video_id)
+    raw_title = meta.get("title") or video_id
+    safe_title = re.sub(r'[\\/*?:"<>|]', "", raw_title).strip() or video_id
+    return FileResponse(
+        path=str(audio_path),
+        media_type="audio/wav",
+        filename=f"{safe_title}_original.wav"
+    )
 
 
 @app.get("/api/search")

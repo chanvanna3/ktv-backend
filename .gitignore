@@ -1,0 +1,27 @@
+# Dependencies & Caches
+__pycache__/
+*.py[cod]
+*$py.class
+.venv/
+env/
+venv/
+ENV/
+
+# Large audio files and stem outputs
+output/
+*.wav
+*.mp3
+*.mp4
+*.m4a
+*.webm
+
+# Sensitive environment variables
+.env
+.env.local
+.env.*.local
+*.env
+
+# Logs & temp
+*.log
+.DS_Store
+Thumbs.db

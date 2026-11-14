@@ -1,0 +1,14 @@
+services:
+  - type: web
+    name: ktv-backend
+    runtime: docker
+    dockerfilePath: Dockerfile
+    plan: starter
+    region: singapore
+    envVars:
+      - key: PORT
+        value: 8000
+      - key: DEMUCS_MODEL
+        value: htdemucs
+      - key: YOUTUBE_API_KEY
+        sync: false

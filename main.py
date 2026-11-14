@@ -879,5 +879,6 @@ async def save_or_edit_lyrics(video_id: str, req: SaveLyricsRequest):
 if __name__ == "__main__":
     import uvicorn
     host = os.getenv("HOST", "0.0.0.0")
-    port = int(os.getenv("PORT", "8000"))
-    uvicorn.run("main:app", host=host, port=port, reload=True)
+    port = int(os.getenv("PORT", "10000"))
+    logger.info(f"Starting server on {host}:{port}")
+    uvicorn.run("main:app", host=host, port=port)

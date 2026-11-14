@@ -1,8 +1,9 @@
 FROM python:3.10-slim
 
-# Install system dependencies (ffmpeg is strictly required for yt-dlp & demucs)
+# Install system dependencies (ffmpeg is strictly required for yt-dlp & demucs; nodejs is required for yt-dlp YouTube JS challenge solver)
 RUN apt-get update && apt-get install -y --no-install-recommends \
     ffmpeg \
+    nodejs \
     git \
     curl \
     build-essential \

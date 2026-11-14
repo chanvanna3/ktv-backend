@@ -126,7 +126,7 @@ def download_audio(video_id: str, target_dir: Path) -> Path:
     out_template = str(target_dir / "audio.%(ext)s")
     url = f"https://www.youtube.com/watch?v={video_id}"
 
-    # Multi-client strategy: Android client has the highest success rate without bot challenge
+    # Multi-client strategy: Android, Android Embedded, TV Embedded, and Web (with Node.js JS solver)
     strategies = [
         # Strategy 1: Android InnerTube (bypasses bot challenge and format 18 SABR experiment)
         {
@@ -135,28 +135,36 @@ def download_audio(video_id: str, target_dir: Path) -> Path:
             'extractor_args': {
                 'youtube': {
                     'player_client': ['android'],
-                    'player_skip': ['webpage', 'configs'],
                 }
             },
         },
-        # Strategy 2: iOS InnerTube
+        # Strategy 2: Android Embedded (extracts direct format 251 Opus)
         {
-            'name': 'iOS InnerTube',
+            'name': 'Android Embedded',
             'format': 'ba/b/best',
             'extractor_args': {
                 'youtube': {
-                    'player_client': ['ios'],
-                    'player_skip': ['webpage', 'configs'],
+                    'player_client': ['android_embedded'],
                 }
             },
         },
-        # Strategy 3: Web Embedded
+        # Strategy 3: TV Embedded (extracts direct format 251 Opus)
         {
-            'name': 'Web Embedded',
+            'name': 'TV Embedded',
             'format': 'ba/b/best',
             'extractor_args': {
                 'youtube': {
-                    'player_client': ['web_embedded'],
+                    'player_client': ['tv_embedded'],
+                }
+            },
+        },
+        # Strategy 4: Web with JS Challenge Solver
+        {
+            'name': 'Web with JS Solver',
+            'format': 'ba/b/best',
+            'extractor_args': {
+                'youtube': {
+                    'player_client': ['web'],
                 }
             },
         },

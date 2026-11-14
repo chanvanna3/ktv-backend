@@ -417,6 +417,18 @@ class HistoryItemRequest(BaseModel):
     title: Optional[str] = None
 
 
+@app.get("/")
+async def root():
+    return {
+        "app": "YouTube AI Karaoke Studio API",
+        "status": "online",
+        "version": "2.1.0",
+        "demucs_model": DEMUCS_MODEL,
+        "docs": "/docs",
+        "health": "/api/health"
+    }
+
+
 @app.get("/api/health")
 async def health_check():
     return {

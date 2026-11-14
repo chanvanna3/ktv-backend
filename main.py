@@ -187,8 +187,16 @@ def download_audio(video_id: str, target_dir: Path) -> Path:
         }
 
         # Optional: If YOUTUBE_COOKIES env or cookies.txt exists, pass to yt-dlp
+        cookies_env = os.getenv("YOUTUBE_COOKIES")
         cookies_path = BASE_DIR / "cookies.txt"
-        if cookies_path.is_file():
+        if cookies_env and not cookies_path.is_file():
+            try:
+                with open(cookies_path, "w", encoding="utf-8") as f:
+                    f.write(cookies_env.strip())
+            except Exception as e:
+                logger.warning(f"Failed to write YOUTUBE_COOKIES env to file: {e}")
+
+        if cookies_path.is_file() and cookies_path.stat().st_size > 10:
             ydl_opts['cookiefile'] = str(cookies_path)
 
         try:
@@ -238,6 +246,10 @@ def run_demucs_separation_sync(video_id: str, audio_path: Path, output_dir: Path
         "demucs.separate",
         "-n",
         DEMUCS_MODEL,
+        "-d",
+        "cpu",
+        "-j",
+        "4",
         "--two-stems=vocals",
         "-o",
         str(temp_demucs_dir),
@@ -707,11 +719,23 @@ async def search_youtube(q: str = Query(..., min_length=1, description="Search q
         raise HTTPException(status_code=500, detail=f"Search failed: {str(e)}")
 
 
+_whisper_model = None
+
+def get_whisper_model():
+    global _whisper_model
+    if _whisper_model is None:
+        import whisper
+        logger.info("Loading Whisper 'base' model into memory...")
+        _whisper_model = whisper.load_model("base")
+        logger.info("Whisper 'base' model loaded successfully.")
+    return _whisper_model
+
+
 def fetch_lyrics_for_video(video_id: str, force_whisper: bool = False, force_lang: Optional[str] = "km") -> Dict[str, Any]:
     """
     Extracts synchronized timestamped lyrics for a song:
     1. YouTube captions / timedtext json3 format (with millisecond sync)
-    2. Whisper AI transcription on isolated vocals stem (vocals.wav) using Whisper 'base' model
+    2. Whisper AI transcription on isolated vocals stem (vocals.wav) or audio.wav using Whisper 'base' model
     """
     video_dir = get_video_dir(video_id)
     lyrics_file = video_dir / "lyrics.json"
@@ -719,23 +743,24 @@ def fetch_lyrics_for_video(video_id: str, force_whisper: bool = False, force_lan
     title = meta.get("title", "")
     channel = meta.get("channel", "")
 
-    # Language resolution: Defaults to 'km' (Khmer / Cambodia)
-    req_lang = (force_lang or "km").lower().strip()
-    if req_lang in ("km", "khmer", "cambodia"):
+    # Language resolution: Detect if song is Khmer or International
+    req_lang = (force_lang or "auto").lower().strip()
+    corpus = f"{title} {channel}".lower()
+    has_khmer_text = bool(re.search(r'[\u1780-\u17FF]', corpus)) or any(
+        kw in corpus for kw in ("khmer", "cambodia", "manith", "tena", "jerm", "vannda", "rhm", "sunday", "town", "hang meas", "pleng")
+    )
+    if req_lang in ("km", "khmer", "cambodia") or (req_lang in ("auto", "") and has_khmer_text):
         is_khmer = True
         target_lang = "km"
     elif req_lang in ("en", "english"):
         is_khmer = False
         target_lang = "en"
     elif req_lang == "auto":
-        corpus = f"{title} {channel}".lower()
-        is_khmer = bool(re.search(r'[\u1780-\u17FF]', corpus)) or any(
-            kw in corpus for kw in ("khmer", "cambodia", "manith", "tena", "jerm", "vannda", "rhm", "sunday", "town")
-        )
-        target_lang = "km" if is_khmer else None
+        is_khmer = False
+        target_lang = None
     else:
-        is_khmer = True
-        target_lang = "km"
+        is_khmer = has_khmer_text
+        target_lang = "km" if is_khmer else None
 
     # 1. Return cached lyrics if exists and not forcing re-transcribe
     if not force_whisper and lyrics_file.exists():
@@ -768,6 +793,15 @@ def fetch_lyrics_for_video(video_id: str, force_whisper: bool = False, force_lan
                 else:
                     chosen_track = subs.get("km") or auto_subs.get("km") or subs.get("en") or auto_subs.get("en")
 
+                # Fallback to ANY available subtitles if preferred language not found
+                if not chosen_track:
+                    chosen_track = (
+                        subs.get("km") or auto_subs.get("km") or
+                        subs.get("en") or auto_subs.get("en") or
+                        (list(subs.values())[0] if subs else None) or
+                        (list(auto_subs.values())[0] if auto_subs else None)
+                    )
+
                 if chosen_track:
                     json3_format = next((fmt for fmt in chosen_track if fmt.get("ext") == "json3"), None)
                     if json3_format and json3_format.get("url"):
@@ -786,8 +820,8 @@ def fetch_lyrics_for_video(video_id: str, force_whisper: bool = False, force_lan
                                         t_end = t_start + d_dur
 
                                         if segments and segments[-1]["text"] == text:
-                                            segments[-1]["end"] = max(segments[-1]["end"], round(t_end, 2))
-                                            continue
+                                             segments[-1]["end"] = max(segments[-1]["end"], round(t_end, 2))
+                                             continue
 
                                         segments.append({
                                             "id": idx,
@@ -804,22 +838,27 @@ def fetch_lyrics_for_video(video_id: str, force_whisper: bool = False, force_lan
         except Exception as e:
             logger.warning(f"YouTube captions fetch error for {video_id}: {e}")
 
-    # Strategy 2: AI Whisper Base Transcription on vocals stem (with Khmer language enforcement)
+    # Strategy 2: AI Whisper Base Transcription on vocals stem or audio.wav
     if not segments:
         try:
             vocals_path = video_dir / "vocals.wav"
             audio_path = video_dir / "audio.wav"
+
+            # If audio has not been downloaded yet, download it immediately
+            if not vocals_path.exists() and not audio_path.exists():
+                logger.info(f"Downloading audio for Whisper AI transcription ({video_id})...")
+                audio_path = download_audio(video_id, video_dir)
+
             target_audio = vocals_path if vocals_path.exists() else (audio_path if audio_path.exists() else None)
 
             if target_audio and target_audio.exists():
-                import whisper
-                logger.info(f"Transcribing {target_audio.name} using Whisper Base AI for {video_id} (is_khmer={is_khmer})...")
-                model = whisper.load_model("base")
+                logger.info(f"Transcribing {target_audio.name} using Whisper Base AI for {video_id} (is_khmer={is_khmer}, target_lang={target_lang})...")
+                model = get_whisper_model()
 
                 transcribe_kwargs = {"fp16": False}
                 if target_lang:
                     transcribe_kwargs["language"] = target_lang
-                if target_lang == "km" or is_khmer:
+                if is_khmer:
                     transcribe_kwargs["initial_prompt"] = "ទំនុកច្រៀងចម្រៀងខ្មែរ ភាសាខ្មែរ អក្សរខ្មែរ Cambodia Khmer song lyrics"
 
                 res = model.transcribe(str(target_audio), **transcribe_kwargs)
@@ -863,16 +902,16 @@ class SaveLyricsRequest(BaseModel):
 
 
 @app.get("/api/lyrics/{video_id}")
-async def get_lyrics(video_id: str, force_whisper: bool = False, lang: Optional[str] = "km"):
+async def get_lyrics(video_id: str, force_whisper: bool = False, lang: Optional[str] = "auto"):
     """Returns timestamped synchronized lyrics for karaoke singing."""
     if not validate_video_id(video_id):
         raise HTTPException(status_code=400, detail="Invalid video ID")
-    return await asyncio.to_thread(fetch_lyrics_for_video, video_id, force_whisper, lang or "km")
+    return await asyncio.to_thread(fetch_lyrics_for_video, video_id, force_whisper, lang or "auto")
 
 
 @app.post("/api/lyrics/{video_id}")
 async def save_or_edit_lyrics(video_id: str, req: SaveLyricsRequest):
-    """Allows user to paste or edit lyrics directly for a song."""
+    """Allows user to paste or edit lyrics directly for a song, or trigger transcription."""
     if not validate_video_id(video_id):
         raise HTTPException(status_code=400, detail="Invalid video ID")
 
@@ -881,9 +920,9 @@ async def save_or_edit_lyrics(video_id: str, req: SaveLyricsRequest):
     meta = read_metadata(video_id)
     duration = meta.get("duration", 240) or 240
 
-    # Case A: Re-transcribe with Whisper specifically
-    if req.force_whisper:
-        return await asyncio.to_thread(fetch_lyrics_for_video, video_id, True, req.language or "km")
+    # Case A: Re-transcribe with Whisper or language switch request
+    if req.force_whisper or (not req.lyrics and not req.raw_text):
+        return await asyncio.to_thread(fetch_lyrics_for_video, video_id, bool(req.force_whisper), req.language or "auto")
 
     # Case B: User submitted structured lyrics array
     if req.lyrics and isinstance(req.lyrics, list) and len(req.lyrics) > 0:
@@ -934,6 +973,6 @@ async def save_or_edit_lyrics(video_id: str, req: SaveLyricsRequest):
 if __name__ == "__main__":
     import uvicorn
     host = os.getenv("HOST", "0.0.0.0")
-    port = int(os.getenv("PORT", "10000"))
+    port = int(os.getenv("PORT", "8000"))
     logger.info(f"Starting server on {host}:{port}")
-    uvicorn.run("main:app", host=host, port=port)
+    uvicorn.run(app, host=host, port=port)

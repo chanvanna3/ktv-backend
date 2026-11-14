@@ -121,55 +121,86 @@ def save_metadata(video_id: str, data: Dict[str, Any]):
 
 
 def download_audio(video_id: str, target_dir: Path) -> Path:
-    """Downloads best audio from YouTube as a WAV file using yt-dlp with mobile client emulation."""
+    """Downloads audio from YouTube as a WAV file using resilient multi-client strategies to bypass datacenter IP bot detection."""
     target_dir.mkdir(parents=True, exist_ok=True)
     out_template = str(target_dir / "audio.%(ext)s")
     url = f"https://www.youtube.com/watch?v={video_id}"
 
-    ydl_opts = {
-        'format': 'bestaudio/best',
-        'outtmpl': out_template,
-        'postprocessors': [{
-            'key': 'FFmpegExtractAudio',
-            'preferredcodec': 'wav',
-            'preferredquality': '192',
-        }],
-        'quiet': True,
-        'no_warnings': True,
-        'extract_flat': False,
-        # Emulate Android & iOS client to bypass YouTube datacenter IP bot detection
-        'extractor_args': {
-            'youtube': {
-                'player_client': ['android', 'ios', 'web_embedded', 'mweb'],
-                'player_skip': ['webpage', 'configs'],
-            }
+    # Multi-client strategy: Android client has the highest success rate without bot challenge
+    strategies = [
+        # Strategy 1: Android InnerTube (bypasses bot challenge and format 18 SABR experiment)
+        {
+            'name': 'Android InnerTube',
+            'format': 'ba/b/best',
+            'extractor_args': {
+                'youtube': {
+                    'player_client': ['android'],
+                    'player_skip': ['webpage', 'configs'],
+                }
+            },
         },
-        'http_headers': {
-            'User-Agent': 'Mozilla/5.0 (Linux; Android 11; Pixel 5) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Mobile Safari/537.36',
-            'Accept-Language': 'en-US,en;q=0.9',
+        # Strategy 2: iOS InnerTube
+        {
+            'name': 'iOS InnerTube',
+            'format': 'ba/b/best',
+            'extractor_args': {
+                'youtube': {
+                    'player_client': ['ios'],
+                    'player_skip': ['webpage', 'configs'],
+                }
+            },
         },
-    }
+        # Strategy 3: Web Embedded
+        {
+            'name': 'Web Embedded',
+            'format': 'ba/b/best',
+            'extractor_args': {
+                'youtube': {
+                    'player_client': ['web_embedded'],
+                }
+            },
+        },
+    ]
 
-    # Optional: If YOUTUBE_COOKIES env or cookies.txt exists, pass to yt-dlp
-    cookies_path = BASE_DIR / "cookies.txt"
-    if cookies_path.is_file():
-        ydl_opts['cookiefile'] = str(cookies_path)
+    last_error = None
+    for strat in strategies:
+        ydl_opts = {
+            'format': strat['format'],
+            'outtmpl': out_template,
+            'postprocessors': [{
+                'key': 'FFmpegExtractAudio',
+                'preferredcodec': 'wav',
+                'preferredquality': '192',
+            }],
+            'quiet': True,
+            'no_warnings': True,
+            'extract_flat': False,
+            'extractor_args': strat.get('extractor_args', {}),
+        }
 
-    logger.info(f"Downloading audio for video {video_id} using yt-dlp...")
-    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+        # Optional: If YOUTUBE_COOKIES env or cookies.txt exists, pass to yt-dlp
+        cookies_path = BASE_DIR / "cookies.txt"
+        if cookies_path.is_file():
+            ydl_opts['cookiefile'] = str(cookies_path)
+
         try:
-            info = ydl.extract_info(url, download=True)
-            meta = {
-                "title": info.get("title", f"Video {video_id}"),
-                "channel": info.get("uploader", "Unknown"),
-                "duration": info.get("duration", 0),
-                "thumbnail": info.get("thumbnail", ""),
-                "video_id": video_id
-            }
-            save_metadata(video_id, meta)
+            logger.info(f"Downloading audio for {video_id} using {strat['name']}...")
+            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                info = ydl.extract_info(url, download=True)
+                meta = {
+                    "title": info.get("title", f"Video {video_id}"),
+                    "channel": info.get("uploader", "Unknown"),
+                    "duration": info.get("duration", 0),
+                    "thumbnail": info.get("thumbnail", ""),
+                    "video_id": video_id
+                }
+                save_metadata(video_id, meta)
+                break
         except Exception as e:
-            logger.error(f"yt-dlp extraction failed for {video_id}: {e}")
-            raise Exception(f"Failed to fetch YouTube audio: {str(e)}")
+            logger.warning(f"Download strategy {strat['name']} failed: {e}")
+            last_error = e
+    else:
+        raise Exception(f"Failed to fetch YouTube audio: {str(last_error)}")
 
     wav_file = target_dir / "audio.wav"
     if not wav_file.exists():

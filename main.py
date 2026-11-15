@@ -442,18 +442,19 @@ async def run_pipeline(video_id: str, force: bool = False, lang: Optional[str] =
                 except Exception as e:
                     logger.warning(f"Lyrics transcribe notice: {e}")
 
+            lyrics_ready = lyrics_exist(video_id)
             active_jobs[video_id] = {
                 "status": "completed",
-                "stage": "completed" if lyrics_exist(video_id) else "ready_to_sing",
-                "progress": 100,
-                "message": "Vocal cut completed! Ready to sing / download instrumental.",
+                "stage": "completed" if lyrics_ready else "ready_to_sing",
+                "progress": 100 if lyrics_ready else 95,
+                "message": "Vocal cut and lyrics are ready." if lyrics_ready else "Vocal cut is ready; lyrics transcription was unavailable for this source.",
                 "video_id": video_id,
                 "title": meta.get("title", f"YouTube Video ({video_id})"),
                 "vocals_url": f"/media/{video_id}/vocals.wav",
                 "instrumental_url": f"/media/{video_id}/no_vocals.wav",
                 "direct_audio_url": f"/media/{video_id}/audio.wav" if (video_dir / "audio.wav").exists() else None,
                 "original_audio_url": f"/media/{video_id}/audio.wav" if (video_dir / "audio.wav").exists() else None,
-                "lyrics_ready": lyrics_exist(video_id),
+                "lyrics_ready": lyrics_ready,
                 "cached": True
             }
             return
@@ -497,14 +498,22 @@ async def run_pipeline(video_id: str, force: bool = False, lang: Optional[str] =
 
             # Stage 4: Transcribing Lyrics in background (does not block playback or download)
             try:
-                await asyncio.to_thread(fetch_lyrics_for_video, video_id, False, lang)
+                lyrics_result = await asyncio.to_thread(fetch_lyrics_for_video, video_id, False, lang)
+                if lyrics_result.get("status") != "success":
+                    logger.info("Lyrics unavailable for %s: %s", video_id, lyrics_result.get("error_code", "not_found"))
             except Exception as lyr_err:
                 logger.warning(f"Background lyrics transcription notice for {video_id}: {lyr_err}")
 
-            active_jobs[video_id]["progress"] = 100
-            active_jobs[video_id]["stage"] = "completed"
-            active_jobs[video_id]["lyrics_ready"] = lyrics_exist(video_id)
-            logger.info(f"Video {video_id} processing completed successfully.")
+            lyrics_ready = lyrics_exist(video_id)
+            active_jobs[video_id]["progress"] = 100 if lyrics_ready else 95
+            active_jobs[video_id]["stage"] = "completed" if lyrics_ready else "ready_to_sing"
+            active_jobs[video_id]["lyrics_ready"] = lyrics_ready
+            active_jobs[video_id]["message"] = (
+                "Vocal cut and lyrics are ready."
+                if lyrics_ready else
+                "Vocal cut is ready; lyrics transcription was unavailable for this source."
+            )
+            logger.info("Audio separation finished for %s (lyrics_ready=%s)", video_id, lyrics_ready)
 
         except Exception as e:
             logger.error(f"Separation failed for {video_id}: {e}", exc_info=True)
@@ -743,10 +752,8 @@ async def get_status(video_id: str):
         if (video_dir / "audio.wav").exists():
             job["direct_audio_url"] = f"/media/{video_id}/audio.wav"
             job["original_audio_url"] = f"/media/{video_id}/audio.wav"
-        if (video_dir / "no_vocals.wav").exists() and (video_dir / "no_vocals.wav").stat().st_size > 1000:
-            job["instrumental_url"] = f"/media/{video_id}/no_vocals.wav"
-            job["vocals_url"] = f"/media/{video_id}/vocals.wav"
-            job["status"] = "completed"
+        # Never infer success from leftover files: only the validated cache branch
+        # above may publish stems. The pipeline sets completed after Demucs validates.
         return job
 
     # 3. Idle / not started
@@ -937,6 +944,7 @@ def fetch_lyrics_for_video(video_id: str, force_whisper: bool = False, force_lan
 
     segments = []
     source = "none"
+    transcription_error = None
 
     # Strategy 1: YouTube subtitles via yt-dlp (Only if not force_whisper)
     if not force_whisper:
@@ -1038,13 +1046,25 @@ def fetch_lyrics_for_video(video_id: str, force_whisper: bool = False, force_lan
                 if segments:
                     source = "whisper_ai"
         except Exception as e:
+            transcription_error = e
             logger.warning(f"Whisper transcription warning for {video_id}: {e}")
 
+    bot_blocked = bool(transcription_error and re.search(
+        r"sign in|not a bot|confirm you.re not a bot|http error 403", str(transcription_error), re.IGNORECASE
+    ))
     result_payload = {
-        "status": "success" if segments else "not_found",
+        "status": "success" if segments else ("error" if transcription_error else "not_found"),
         "video_id": video_id,
         "source": source,
-        "lyrics": segments
+        "lyrics": segments,
+        "error_code": ("YOUTUBE_ACCESS_BLOCKED" if bot_blocked else "TRANSCRIPTION_FAILED") if transcription_error else None,
+        "message": (
+            "YouTube បានរារាំង Cloud server មិនឱ្យទាញយកសំឡេងសម្រាប់ Transcribe។ សូមប្រើប្រភពសំឡេងដែលអ្នកមានសិទ្ធិប្រើ។"
+            if bot_blocked else
+            "AI Transcribe មិនអាចដំណើរការបានទេ។ សូមពិនិត្យប្រភពសំឡេង ហើយសាកល្បងម្តងទៀត។"
+            if transcription_error else
+            "មិនរកឃើញសំឡេងនិយាយ ឬច្រៀងក្នុងបទនេះទេ។" if not segments else None
+        )
     }
 
     if segments:

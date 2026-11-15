@@ -6,6 +6,8 @@ import asyncio
 import logging
 import re
 import time
+import wave
+import hashlib
 from pathlib import Path
 from typing import Optional, Dict, Any, List
 
@@ -42,11 +44,14 @@ app = FastAPI(
     version="2.1.0"
 )
 
-# Enable CORS for frontend applications (Vite, Next.js, etc.)
+cors_origins = [origin.strip() for origin in os.getenv(
+    "CORS_ORIGINS",
+    "https://ktv-frontend-xi.vercel.app,http://localhost:5173,http://127.0.0.1:5173"
+).split(",") if origin.strip()]
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
+    allow_origins=cors_origins,
+    allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],
 )
@@ -75,16 +80,24 @@ def get_video_dir(video_id: str) -> Path:
 
 
 def stems_exist(video_id: str) -> bool:
-    """Checks if separated stems already exist in cache."""
+    """Checks that generated stems have a matching successful validation record."""
     video_dir = get_video_dir(video_id)
     vocals_file = video_dir / "vocals.wav"
     no_vocals_file = video_dir / "no_vocals.wav"
-    return (
-        vocals_file.is_file()
-        and no_vocals_file.is_file()
-        and vocals_file.stat().st_size > 1000
-        and no_vocals_file.stat().st_size > 1000
-    )
+    validation_file = video_dir / "validated_stems.json"
+    if not (vocals_file.is_file() and no_vocals_file.is_file() and validation_file.is_file()):
+        return False
+    try:
+        validation = json.loads(validation_file.read_text(encoding="utf-8"))
+        return (
+            validation.get("status") == "validated"
+            and validation.get("vocals_bytes") == vocals_file.stat().st_size
+            and validation.get("instrumental_bytes") == no_vocals_file.stat().st_size
+            and validation.get("vocals_duration", 0) > 0
+            and validation.get("instrumental_duration", 0) > 0
+        )
+    except (OSError, ValueError, TypeError):
+        return False
 
 
 def lyrics_exist(video_id: str) -> bool:
@@ -297,8 +310,8 @@ def run_demucs_separation_sync(video_id: str, audio_path: Path, output_dir: Path
         active_jobs[video_id]["message"] = "កំពុងរៀបចំ និងរក្សាទុកឯកសារភ្លេងខារ៉ាអូខេ..."
 
     # Locate generated stems dynamically
-    found_vocals = list(temp_demucs_dir.rglob("vocals.wav")) or list(Path("separated").rglob("vocals.wav"))
-    found_no_vocals = list(temp_demucs_dir.rglob("no_vocals.wav")) or list(Path("separated").rglob("no_vocals.wav"))
+    found_vocals = list(temp_demucs_dir.rglob("vocals.wav"))
+    found_no_vocals = list(temp_demucs_dir.rglob("no_vocals.wav"))
 
     if not found_vocals:
         found_vocals = [p for p in temp_demucs_dir.rglob("*.wav") if "vocal" in p.name.lower() and "no" not in p.name.lower()]
@@ -310,6 +323,33 @@ def run_demucs_separation_sync(video_id: str, audio_path: Path, output_dir: Path
 
     src_vocals = found_vocals[0]
     src_no_vocals = found_no_vocals[0]
+
+    def wav_duration(path: Path) -> float:
+        try:
+            with wave.open(str(path), "rb") as audio:
+                if audio.getnchannels() < 1 or audio.getframerate() < 1 or audio.getnframes() < 1:
+                    raise ValueError("WAV has no audio frames")
+                return audio.getnframes() / float(audio.getframerate())
+        except Exception as exc:
+            raise Exception(f"Invalid Demucs WAV output ({path.name}): {exc}") from exc
+
+    def file_hash(path: Path) -> bytes:
+        digest = hashlib.sha256()
+        with path.open("rb") as source:
+            for chunk in iter(lambda: source.read(1024 * 1024), b""):
+                digest.update(chunk)
+        return digest.digest()
+
+    original_hash = file_hash(audio_path)
+    for stem in (src_vocals, src_no_vocals):
+        if file_hash(stem) == original_hash:
+            raise Exception(f"Demucs output {stem.name} is an exact copy of the source audio")
+
+    source_duration = wav_duration(audio_path)
+    for stem in (src_vocals, src_no_vocals):
+        stem_duration = wav_duration(stem)
+        if abs(stem_duration - source_duration) > max(2.0, source_duration * 0.02):
+            raise Exception(f"Demucs output {stem.name} duration does not match source audio")
 
     if src_vocals.stat().st_size < 1000:
         raise Exception(f"Demucs generated invalid/empty vocals stem: {src_vocals}")
@@ -339,6 +379,19 @@ def run_demucs_separation_sync(video_id: str, audio_path: Path, output_dir: Path
         raise Exception("Target vocals.wav was not written successfully.")
     if not target_no_vocals.is_file() or target_no_vocals.stat().st_size < 1000:
         raise Exception("Target no_vocals.wav was not written successfully.")
+    wav_duration(target_vocals)
+    wav_duration(target_no_vocals)
+    validation = {
+        "status": "validated",
+        "vocals_bytes": target_vocals.stat().st_size,
+        "instrumental_bytes": target_no_vocals.stat().st_size,
+        "vocals_duration": wav_duration(target_vocals),
+        "instrumental_duration": wav_duration(target_no_vocals),
+        "model": DEMUCS_MODEL,
+    }
+    (output_dir / "validated_stems.json").write_text(
+        json.dumps(validation, ensure_ascii=False, indent=2), encoding="utf-8"
+    )
 
     # Clean up temporary demucs folder to conserve disk space
     try:
@@ -370,6 +423,7 @@ async def run_pipeline(video_id: str, force: bool = False, lang: Optional[str] =
                     "vocals_url": f"/media/{video_id}/vocals.wav",
                     "instrumental_url": f"/media/{video_id}/no_vocals.wav",
                     "direct_audio_url": f"/media/{video_id}/audio.wav" if (video_dir / "audio.wav").exists() else None,
+                    "original_audio_url": f"/media/{video_id}/audio.wav" if (video_dir / "audio.wav").exists() else None,
                     "lyrics_ready": False,
                     "cached": True
                 }
@@ -388,6 +442,7 @@ async def run_pipeline(video_id: str, force: bool = False, lang: Optional[str] =
                 "vocals_url": f"/media/{video_id}/vocals.wav",
                 "instrumental_url": f"/media/{video_id}/no_vocals.wav",
                 "direct_audio_url": f"/media/{video_id}/audio.wav" if (video_dir / "audio.wav").exists() else None,
+                "original_audio_url": f"/media/{video_id}/audio.wav" if (video_dir / "audio.wav").exists() else None,
                 "lyrics_ready": lyrics_exist(video_id),
                 "cached": True
             }
@@ -407,6 +462,7 @@ async def run_pipeline(video_id: str, force: bool = False, lang: Optional[str] =
 
             active_jobs[video_id]["progress"] = 35
             active_jobs[video_id]["direct_audio_url"] = f"/media/{video_id}/audio.wav"
+            active_jobs[video_id]["original_audio_url"] = f"/media/{video_id}/audio.wav"
             active_jobs[video_id]["message"] = "Separating vocals with AI..."
 
             # Stage 2: Separating with Demucs AI
@@ -426,6 +482,7 @@ async def run_pipeline(video_id: str, force: bool = False, lang: Optional[str] =
             active_jobs[video_id]["vocals_url"] = f"/media/{video_id}/vocals.wav"
             active_jobs[video_id]["instrumental_url"] = f"/media/{video_id}/no_vocals.wav"
             active_jobs[video_id]["direct_audio_url"] = f"/media/{video_id}/audio.wav"
+            active_jobs[video_id]["original_audio_url"] = f"/media/{video_id}/audio.wav"
             active_jobs[video_id]["lyrics_ready"] = lyrics_exist(video_id)
 
             # Stage 4: Transcribing Lyrics in background (does not block playback or download)
@@ -613,6 +670,7 @@ async def process_video(req: ProcessRequest, background_tasks: BackgroundTasks):
             "vocals_url": f"/media/{video_id}/vocals.wav",
             "instrumental_url": f"/media/{video_id}/no_vocals.wav",
             "direct_audio_url": f"/media/{video_id}/audio.wav" if (video_dir / "audio.wav").exists() else None,
+            "original_audio_url": f"/media/{video_id}/audio.wav" if (video_dir / "audio.wav").exists() else None,
             "lyrics_ready": has_lyrics,
             "cached": True
         }
@@ -663,6 +721,7 @@ async def get_status(video_id: str):
             "vocals_url": f"/media/{video_id}/vocals.wav",
             "instrumental_url": f"/media/{video_id}/no_vocals.wav",
             "direct_audio_url": f"/media/{video_id}/audio.wav" if (video_dir / "audio.wav").exists() else None,
+            "original_audio_url": f"/media/{video_id}/audio.wav" if (video_dir / "audio.wav").exists() else None,
             "lyrics_ready": has_lyrics,
             "cached": True
         }
@@ -673,6 +732,7 @@ async def get_status(video_id: str):
         video_dir = get_video_dir(video_id)
         if (video_dir / "audio.wav").exists():
             job["direct_audio_url"] = f"/media/{video_id}/audio.wav"
+            job["original_audio_url"] = f"/media/{video_id}/audio.wav"
         if (video_dir / "no_vocals.wav").exists() and (video_dir / "no_vocals.wav").stat().st_size > 1000:
             job["instrumental_url"] = f"/media/{video_id}/no_vocals.wav"
             job["vocals_url"] = f"/media/{video_id}/vocals.wav"

@@ -8,6 +8,7 @@ import re
 import time
 import wave
 import hashlib
+import uuid
 from pathlib import Path
 from typing import Optional, Dict, Any, List
 
@@ -100,7 +101,7 @@ def stems_exist(video_id: str) -> bool:
         return False
 
 
-def lyrics_exist(video_id: str) -> bool:
+def lyrics_exist(video_id: str, required_source: Optional[str] = None) -> bool:
     """Checks if synchronized lyrics exist on disk."""
     video_dir = get_video_dir(video_id)
     lyrics_file = video_dir / "lyrics.json"
@@ -108,7 +109,11 @@ def lyrics_exist(video_id: str) -> bool:
         try:
             with open(lyrics_file, "r", encoding="utf-8") as f:
                 data = json.load(f)
-                return bool(data.get("status") == "success" and data.get("lyrics"))
+                return bool(
+                    data.get("status") == "success"
+                    and data.get("lyrics")
+                    and (required_source is None or data.get("source") == required_source)
+                )
         except Exception:
             return False
     return False
@@ -421,28 +426,7 @@ async def run_pipeline(video_id: str, force: bool = False, lang: Optional[str] =
         # Check if already cached (stems exist on disk)
         if not force and stems_exist(video_id):
             meta = read_metadata(video_id)
-            has_lyrics = lyrics_exist(video_id)
-            if not has_lyrics:
-                active_jobs[video_id] = {
-                    "status": "completed",
-                    "stage": "ready_to_sing",
-                    "progress": 95,
-                    "message": "Vocal cut completed! Ready to sing / download instrumental.",
-                    "video_id": video_id,
-                    "title": meta.get("title", f"YouTube Video ({video_id})"),
-                    "vocals_url": f"/media/{video_id}/vocals.wav",
-                    "instrumental_url": f"/media/{video_id}/no_vocals.wav",
-                    "direct_audio_url": f"/media/{video_id}/audio.wav" if (video_dir / "audio.wav").exists() else None,
-                    "original_audio_url": f"/media/{video_id}/audio.wav" if (video_dir / "audio.wav").exists() else None,
-                    "lyrics_ready": False,
-                    "cached": True
-                }
-                try:
-                    await asyncio.to_thread(fetch_lyrics_for_video, video_id, False, lang)
-                except Exception as e:
-                    logger.warning(f"Lyrics transcribe notice: {e}")
-
-            lyrics_ready = lyrics_exist(video_id)
+            lyrics_ready = lyrics_exist(video_id, "whisper_ai")
             active_jobs[video_id] = {
                 "status": "completed",
                 "stage": "completed" if lyrics_ready else "ready_to_sing",
@@ -494,17 +478,9 @@ async def run_pipeline(video_id: str, force: bool = False, lang: Optional[str] =
             active_jobs[video_id]["instrumental_url"] = f"/media/{video_id}/no_vocals.wav"
             active_jobs[video_id]["direct_audio_url"] = f"/media/{video_id}/audio.wav"
             active_jobs[video_id]["original_audio_url"] = f"/media/{video_id}/audio.wav"
-            active_jobs[video_id]["lyrics_ready"] = lyrics_exist(video_id)
+            active_jobs[video_id]["lyrics_ready"] = lyrics_exist(video_id, "whisper_ai")
 
-            # Stage 4: Transcribing Lyrics in background (does not block playback or download)
-            try:
-                lyrics_result = await asyncio.to_thread(fetch_lyrics_for_video, video_id, False, lang)
-                if lyrics_result.get("status") != "success":
-                    logger.info("Lyrics unavailable for %s: %s", video_id, lyrics_result.get("error_code", "not_found"))
-            except Exception as lyr_err:
-                logger.warning(f"Background lyrics transcription notice for {video_id}: {lyr_err}")
-
-            lyrics_ready = lyrics_exist(video_id)
+            lyrics_ready = lyrics_exist(video_id, "whisper_ai")
             active_jobs[video_id]["progress"] = 100 if lyrics_ready else 95
             active_jobs[video_id]["stage"] = "completed" if lyrics_ready else "ready_to_sing"
             active_jobs[video_id]["lyrics_ready"] = lyrics_ready
@@ -676,9 +652,7 @@ async def process_video(req: ProcessRequest, background_tasks: BackgroundTasks):
     if not req.force_reprocess and stems_exist(video_id):
         meta = read_metadata(video_id)
         video_dir = get_video_dir(video_id)
-        has_lyrics = lyrics_exist(video_id)
-        if not has_lyrics:
-            background_tasks.add_task(fetch_lyrics_for_video, video_id, False, req.language or "km")
+        has_lyrics = lyrics_exist(video_id, "whisper_ai")
         return {
             "status": "completed",
             "stage": "completed" if has_lyrics else "ready_to_sing",
@@ -729,7 +703,7 @@ async def get_status(video_id: str):
     if stems_exist(video_id):
         meta = read_metadata(video_id)
         video_dir = get_video_dir(video_id)
-        has_lyrics = lyrics_exist(video_id)
+        has_lyrics = lyrics_exist(video_id, "whisper_ai")
         return {
             "status": "completed",
             "stage": "completed" if has_lyrics else "ready_to_sing",
@@ -890,6 +864,7 @@ async def search_youtube(q: str = Query(..., min_length=1, description="Search q
 
 
 _whisper_model = None
+transcription_jobs: Dict[str, Dict[str, Any]] = {}
 
 def get_whisper_model():
     global _whisper_model
@@ -933,12 +908,18 @@ def fetch_lyrics_for_video(video_id: str, force_whisper: bool = False, force_lan
         target_lang = "km" if is_khmer else None
 
     # 1. Return cached lyrics if exists and not forcing re-transcribe
-    if not force_whisper and lyrics_file.exists():
+    if lyrics_file.exists():
         try:
             with open(lyrics_file, "r", encoding="utf-8") as f:
                 data = json.load(f)
                 if data.get("status") == "success" and data.get("lyrics"):
-                    return data
+                    is_matching_whisper_cache = (
+                        force_whisper
+                        and data.get("source") == "whisper_ai"
+                        and data.get("language") == (target_lang or "auto")
+                    )
+                    if not force_whisper or is_matching_whisper_cache:
+                        return data
         except Exception:
             pass
 
@@ -1056,6 +1037,7 @@ def fetch_lyrics_for_video(video_id: str, force_whisper: bool = False, force_lan
         "status": "success" if segments else ("error" if transcription_error else "not_found"),
         "video_id": video_id,
         "source": source,
+        "language": target_lang or "auto",
         "lyrics": segments,
         "error_code": ("YOUTUBE_ACCESS_BLOCKED" if bot_blocked else "TRANSCRIPTION_FAILED") if transcription_error else None,
         "message": (
@@ -1077,6 +1059,57 @@ def fetch_lyrics_for_video(video_id: str, force_whisper: bool = False, force_lan
     return result_payload
 
 
+def run_whisper_transcription_job(video_id: str, language: str, job_id: str):
+    """Run Whisper outside the request and publish a stable pollable result."""
+    try:
+        result = fetch_lyrics_for_video(video_id, True, language)
+    except Exception as exc:
+        logger.exception("Whisper job failed for %s", video_id)
+        result = {
+            "status": "error",
+            "video_id": video_id,
+            "source": "whisper_ai",
+            "language": language,
+            "lyrics": [],
+            "error_code": "TRANSCRIPTION_FAILED",
+            "message": "AI Transcribe មិនអាចដំណើរការបានទេ។ សូមសាកល្បងម្តងទៀត។",
+        }
+
+    current = transcription_jobs.get(video_id)
+    if current and current.get("job_id") == job_id:
+        transcription_jobs[video_id] = {
+            **result,
+            "job_id": job_id,
+            "language": language,
+            "progress": 100 if result.get("status") == "success" else 0,
+        }
+
+
+def queue_whisper_transcription(video_id: str, language: str, background_tasks: BackgroundTasks):
+    current = transcription_jobs.get(video_id)
+    if current and current.get("status") == "processing":
+        return current
+    if current and current.get("status") == "success" and current.get("language") == language:
+        return current
+
+    job_id = uuid.uuid4().hex
+    job = {
+        "status": "processing",
+        "video_id": video_id,
+        "job_id": job_id,
+        "language": language,
+        "source": "whisper_ai",
+        "lyrics": [],
+        "progress": 0,
+        "message": "AI Whisper កំពុង Transcribe សំឡេងច្រៀង...",
+    }
+    transcription_jobs[video_id] = job
+    while len(transcription_jobs) > 200:
+        transcription_jobs.pop(next(iter(transcription_jobs)))
+    background_tasks.add_task(run_whisper_transcription_job, video_id, language, job_id)
+    return job
+
+
 class SaveLyricsRequest(BaseModel):
     lyrics: Optional[list] = None
     raw_text: Optional[str] = None
@@ -1085,15 +1118,17 @@ class SaveLyricsRequest(BaseModel):
 
 
 @app.get("/api/lyrics/{video_id}")
-async def get_lyrics(video_id: str, force_whisper: bool = False, lang: Optional[str] = "auto"):
+async def get_lyrics(video_id: str, background_tasks: BackgroundTasks, force_whisper: bool = False, lang: Optional[str] = "auto"):
     """Returns timestamped synchronized lyrics for karaoke singing."""
     if not validate_video_id(video_id):
         raise HTTPException(status_code=400, detail="Invalid video ID")
+    if force_whisper:
+        return queue_whisper_transcription(video_id, lang or "auto", background_tasks)
     return await asyncio.to_thread(fetch_lyrics_for_video, video_id, force_whisper, lang or "auto")
 
 
 @app.post("/api/lyrics/{video_id}")
-async def save_or_edit_lyrics(video_id: str, req: SaveLyricsRequest):
+async def save_or_edit_lyrics(video_id: str, req: SaveLyricsRequest, background_tasks: BackgroundTasks):
     """Allows user to paste or edit lyrics directly for a song, or trigger transcription."""
     if not validate_video_id(video_id):
         raise HTTPException(status_code=400, detail="Invalid video ID")
@@ -1105,7 +1140,7 @@ async def save_or_edit_lyrics(video_id: str, req: SaveLyricsRequest):
 
     # Case A: Re-transcribe with Whisper or language switch request
     if req.force_whisper or (not req.lyrics and not req.raw_text):
-        return await asyncio.to_thread(fetch_lyrics_for_video, video_id, bool(req.force_whisper), req.language or "auto")
+        return queue_whisper_transcription(video_id, req.language or "auto", background_tasks)
 
     # Case B: User submitted structured lyrics array
     if req.lyrics and isinstance(req.lyrics, list) and len(req.lyrics) > 0:

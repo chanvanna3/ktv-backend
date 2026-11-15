@@ -185,7 +185,10 @@ def download_audio(video_id: str, target_dir: Path) -> Path:
     ]
 
     last_error = None
-    for strat in strategies:
+    for attempt, strat in enumerate(strategies, start=1):
+        if video_id in active_jobs:
+            active_jobs[video_id]["stage"] = "downloading"
+            active_jobs[video_id]["message"] = f"Downloading audio (connection attempt {attempt}/{len(strategies)})..."
         ydl_opts = {
             'format': strat['format'],
             'outtmpl': out_template,
@@ -198,6 +201,13 @@ def download_audio(video_id: str, target_dir: Path) -> Path:
             'no_warnings': True,
             'extract_flat': False,
             'extractor_args': strat.get('extractor_args', {}),
+            # Fail promptly on a blocked/unreachable source rather than leaving the
+            # background job at 15% while yt-dlp retries indefinitely.
+            'socket_timeout': 15,
+            'retries': 1,
+            'fragment_retries': 1,
+            'extractor_retries': 1,
+            'file_access_retries': 1,
         }
 
         # Optional: If YOUTUBE_COOKIES env or cookies.txt exists, pass to yt-dlp
